@@ -54,6 +54,7 @@ import (
 	"github.com/fluxcd/pkg/cache"
 	"github.com/fluxcd/pkg/http/fetch"
 	generator "github.com/fluxcd/pkg/kustomize"
+	"github.com/fluxcd/pkg/masktoken"
 	"github.com/fluxcd/pkg/runtime/acl"
 	"github.com/fluxcd/pkg/runtime/cel"
 	runtimeClient "github.com/fluxcd/pkg/runtime/client"
@@ -433,6 +434,15 @@ func (r *KustomizationReconciler) reconcile(
 		return err
 	}
 
+	// Load the postBuild.substituteFrom variables once (this is the same
+	// loader that generator.SubstituteVariables uses internally in
+	// r.build()), so their values can be redacted from any apply error
+	// surfaced below. This extends the existing SOPS decryption redaction
+	// (see safeDecrypt) to also cover postBuild substitutions. Errors are
+	// ignored here: a failure to load is surfaced again, and handled, by
+	// r.build() below.
+	substituteVars, _ := generator.LoadVariables(ctx, r.Client, unstructured.Unstructured{Object: k})
+
 	// Build the Kustomize overlay and decrypt secrets if needed.
 	resources, err := r.build(ctx, obj, unstructured.Unstructured{Object: k}, tmpDir, dirPath)
 	if err != nil {
@@ -472,6 +482,7 @@ func (r *KustomizationReconciler) reconcile(
 	// Validate and apply resources in stages.
 	drifted, changeSet, err := r.apply(ctx, resourceManager, obj, revision, originRevision, objects)
 	if err != nil {
+		err = maskSecretValues(err, substituteVars)
 		obj.Status.History.Upsert(checksum, time.Now(), time.Since(reconcileStart), meta.ReconciliationFailedReason, historyMeta)
 		conditions.MarkFalse(obj, meta.ReadyCondition, meta.ReconciliationFailedReason, "%s", err)
 		return err
@@ -742,6 +753,30 @@ func (r *KustomizationReconciler) getSource(ctx context.Context,
 			obj.Spec.SourceRef.Name, obj.Spec.SourceRef.Kind)
 	}
 	return src, nil
+}
+
+// maskSecretValues redacts any of the given postBuild.substituteFrom
+// variable values found in the error message, replacing each occurrence
+// with "*****". This extends the existing SOPS decryption redaction (see
+// safeDecrypt) to values substituted into manifests via
+// spec.postBuild.substituteFrom, which the Kubernetes API server can echo
+// back verbatim in an apply validation error (e.g. an over-length label or
+// annotation value).
+func maskSecretValues(err error, vars map[string]string) error {
+	if err == nil || len(vars) == 0 {
+		return err
+	}
+
+	msg := err.Error()
+	for _, v := range vars {
+		if v == "" {
+			continue
+		}
+		if masked, mErr := masktoken.MaskTokenFromString(msg, v); mErr == nil {
+			msg = masked
+		}
+	}
+	return errors.New(msg)
 }
 
 func (r *KustomizationReconciler) generate(obj unstructured.Unstructured,
